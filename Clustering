@@ -1,0 +1,288 @@
+from google.colab import drive, files
+drive.mount('/content/drive')
+
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.cluster import KMeans
+
+# ---------------------- CARGA Y PREPARACIÓN ----------------------
+
+# Cargar base
+ruta_csv = '/content/drive/MyDrive/2. Segmento_Datos completos todo re todo.csv'
+df = pd.read_csv(ruta_csv, sep=';', encoding='utf-8')
+
+# Convertir fechas
+df['FECHA_EMISION'] = pd.to_datetime(df['FECHA_EMISION'], errors='coerce', dayfirst=True)
+df['FECHA_INICIO_VIGENCIA'] = pd.to_datetime(df['FECHA_INICIO_VIGENCIA'], errors='coerce', dayfirst=True)
+df['Fin Vigencia'] = pd.to_datetime(df['Fin Vigencia'], errors='coerce', dayfirst=True)
+
+# Clasificación de edad
+condiciones_edad = [
+    df['Edad Actual'] >= 70,
+    (df['Edad Actual'] >= 60) & (df['Edad Actual'] < 70),
+    (df['Edad Actual'] >= 35) & (df['Edad Actual'] < 60),
+    (df['Edad Actual'] >= 21) & (df['Edad Actual'] < 35),
+    df['Edad Actual'] < 21
+]
+valores_edad = ["Adultos Mayores", "Senior", "Adultos", "Jóvenes", "Menor"]
+df['Clasificacion edad'] = np.select(condiciones_edad, valores_edad, default="Sin clasificar")
+
+# Filtro para Argentina, 2022+ y Adultos
+df = df[
+    (df['PAIS_EMISION'] == 'ARGENTINA') &
+    (df['FECHA_EMISION'].dt.year >= 2022) &
+    (df['Clasificacion edad'].isin(['Adultos']))
+].copy()
+
+# Filtro adicional: excluir Familias
+df = df[df['Clasificación tipo PAX'] == 'Familia']
+
+# Clasificación personalizada tipo de venta
+df['PRODUCTO'] = df['PRODUCTO'].astype(str).str.lower()
+df['Duracion_viaje_dias'] = (df['Fin Vigencia'] - df['FECHA_INICIO_VIGENCIA']).dt.days
+condiciones_tipo = [df['PRODUCTO'].str.contains("anual"), df['Duracion_viaje_dias'] > 60]
+valores_tipo = ["Anual", "Larga estadía"]
+df['tipo_estadia'] = np.select(condiciones_tipo, valores_tipo, default="Módulo")
+df['sufijo_amvr'] = np.where(df['PRODUCTO'].str.contains("reno"), " en AMVR", "")
+df['TIPO_VENTA_FINAL'] = df['tipo_estadia'] + df['sufijo_amvr']
+
+# Reasignar tipo PAX
+df['Clasificación tipo PAX'] = df.apply(
+    lambda row: 'Par' if row['Cantidad PAX por vouchers'] == 2 and row['Tiene Menores'] == 0 else row['Clasificación tipo PAX'],
+    axis=1
+)
+df['Par_o_Impar'] = df.apply(
+    lambda row: 'Par' if row['Cantidad PAX por vouchers'] == 2 and row['Tiene Menores'] == 0 else 'Otro',
+    axis=1
+)
+
+# Mes de inicio
+df['Mes_Inicio_Viaje'] = df['FECHA_INICIO_VIGENCIA'].dt.month
+
+def clasificar_cliente(subdf):
+    subdf = subdf.sort_values('FECHA_EMISION', ascending=False)
+    if len(subdf) == 1:
+        subdf['Clasificación Cliente'] = 'Nuevo'
+    else:
+        fecha1 = subdf.iloc[0]['FECHA_EMISION']
+        fecha2 = subdf.iloc[1]['FECHA_EMISION']
+        dias = (fecha1 - fecha2).days
+        if dias < 65:
+            clasificacion = 'Renovador'
+        elif dias <= 730:
+            clasificacion = 'Repetidor'
+        elif dias <= 913:
+            clasificacion = 'Recuperado en riesgo'
+        else:
+            clasificacion = 'Recuperado inactivo'
+        subdf['Clasificación Cliente'] = clasificacion
+    return subdf
+
+df = df.groupby('Nro Documento', group_keys=False).apply(clasificar_cliente)
+
+# Columnas seleccionadas para clustering
+columnas_cluster = [
+    'TIPO_VENTA_FINAL', 'Tiene Menores', 'Canal Venta', 'Anticipacion de compra',
+    'Cant. Compras', 'Clasificacion edad', 'Clasificación tipo PAX',
+    'DESTINO', 'Gasto promedio por PAX', 'Cantidad PAX por vouchers',
+    'R', 'F', 'M', 'Score RFM', 'Tope de cobertura', 'Precio Unitario USD',
+    'Clasificación Actividad', 'Par_o_Impar', 'Mes_Inicio_Viaje', 'Rango de edades',
+    'ESTADO', 'BBDD Health', 'Clasificación Cliente'  # <--- Clasificación añadida
+]
+
+
+df_subset = df[columnas_cluster].copy()
+
+# Columnas numéricas
+numericas = [
+    'Anticipacion de compra', 'Cant. Compras', 'Gasto promedio por PAX',
+    'Cantidad PAX por vouchers', 'R', 'F', 'M', 'Score RFM', 'Precio Unitario USD'
+]
+
+for col in numericas:
+    df_subset[col] = df_subset[col].astype(str).str.replace(',', '.', regex=False)
+    df_subset[col] = pd.to_numeric(df_subset[col], errors='coerce')
+
+df_subset = df_subset.dropna()
+numericas_final = [col for col in df_subset.columns if df_subset[col].dtype != 'object']
+categoricas_final = [col for col in df_subset.columns if df_subset[col].dtype == 'object']
+
+# Pipeline clustering
+preprocessor = ColumnTransformer([
+    ('num', StandardScaler(), numericas_final),
+    ('cat', OneHotEncoder(drop='first', handle_unknown='ignore'), categoricas_final)
+])
+
+pipeline = Pipeline([
+    ('prep', preprocessor),
+    ('kmeans', KMeans(n_clusters=6, random_state=42))
+])
+
+pipeline.fit(df_subset)
+df_subset['cluster_nuevo'] = pipeline.named_steps['kmeans'].labels_
+
+# ---------------------- FUNCIÓN DE RESUMEN ----------------------
+
+def generar_resumen_por_pais(df, df_subset, pais=None):
+    if pais:
+        mask = df['PAIS_EMISION'] == pais
+        df_pais = df[mask].copy()
+        df_subset_pais = df_subset.loc[df[mask].index.intersection(df_subset.index)].copy()
+    else:
+        df_pais = df.copy()
+        df_subset_pais = df_subset.copy()
+
+    if df_subset_pais.empty:
+        return pd.DataFrame({'Aviso': [f'No hay datos para {pais or "TOTAL"} en df_subset']})
+
+    resumen = []
+    gross_numerico = []
+
+    for cluster in sorted(df_subset_pais['cluster_nuevo'].unique()):
+        dfc = df_pais.loc[df_subset_pais[df_subset_pais['cluster_nuevo'] == cluster].index].copy()
+
+        clientes = len(dfc)
+        porcentaje = round(100 * clientes / len(df_subset_pais), 1)
+
+        edades = dfc['Rango de edades'].value_counts(normalize=True).round(3) * 100
+        top_edades = [f'{k} ({int(v)}%)' for k, v in edades.head(4).items()]
+
+        actividad = dfc['Clasificación Actividad'].value_counts(normalize=True).round(3)
+        estado = ', '.join([f'{k} {int(v*100)}%' for k, v in actividad.items()])
+
+        tope = dfc['Tope de cobertura'].value_counts(normalize=True).round(3).head(3)
+        tope_str = ', '.join([f'{k} {int(v*100)}%' for k, v in tope.items()])
+
+        pax = dfc['Clasificación tipo PAX'].value_counts(normalize=True).round(3).head(3)
+        pax_str = ', '.join([f'{k} {int(v*100)}%' for k, v in pax.items()])
+
+        anticipacion = round(dfc['Anticipacion de compra'].astype(str).str.replace(',', '.', regex=False).astype(float).mean(), 1)
+        compras = round(dfc['Cant. Compras'].astype(str).str.replace(',', '.', regex=False).astype(float).mean(), 2)
+
+        canal = dfc['Canal Venta'].value_counts(normalize=True).round(3).head(3)
+        canal_str = ', '.join([f'{k} {int(v*100)}%' for k, v in canal.items()])
+
+        tipo = dfc['TIPO_VENTA_FINAL'].value_counts(normalize=True).round(3).head(4)
+        tipo_str = ', '.join([f'{k} {int(v*100)}%' for k, v in tipo.items()])
+
+        destinos = dfc['DESTINO'].value_counts(normalize=True).round(3).head(5)
+        destino_str = ', '.join([f'{k} {int(v*100)}%' for k, v in destinos.items()])
+        destino_nac = int((dfc['DESTINO'] == 'Territorio Nacional').mean() * 100)
+        destino_int = 100 - destino_nac
+
+        precio = dfc['Precio Unitario USD'].astype(str).str.replace(',', '.', regex=False).astype(float)
+        pax_cant = dfc['Cantidad PAX por vouchers'].astype(str).str.replace(',', '.', regex=False).astype(float)
+        ticket_medio = round(precio.mean(), 1)
+        ticket_pax = round((precio / pax_cant).mean(), 1)
+        gross = round(ticket_pax * clientes, 0)
+        gross_str = f'USD {int(gross):,}'.replace(",", ".")
+        gross_numerico.append(gross)
+
+                # Estado de cliente
+        estado_cliente = dfc['ESTADO'].value_counts(normalize=True).round(3).head(3)
+        estado_cliente_str = ', '.join([f'{k} {int(v*100)}%' for k, v in estado_cliente.items()])
+
+        # BBDD Health
+        health = dfc['Clasificación Cliente'].value_counts(normalize=True).round(3).head(3)
+        health_str = ', '.join([f'{k} {int(v*100)}%' for k, v in health.items()])
+
+
+        resumen.append({
+            'Segmento': f'Cluster {cluster}',
+            'Clientes': clientes,
+            '% Clientes': f'{porcentaje}%',
+            'Edad 1': top_edades[0] if len(top_edades) > 0 else '',
+            'Edad 2': top_edades[1] if len(top_edades) > 1 else '',
+            'Edad 3': top_edades[2] if len(top_edades) > 2 else '',
+            'Edad 4': top_edades[3] if len(top_edades) > 3 else '',
+            'Estado Cliente': estado,
+            'Tope cobertura': tope_str,
+            'PAX por voucher': pax_str,
+            'Anticipación compra': anticipacion,
+            'Compras promedio': compras,
+            'Canal de compra': canal_str,
+            'Tipo de producto': tipo_str,
+            'Destino nacional': f'{destino_nac}%',
+            'Destino internacional': f'{destino_int}%',
+            'Destino': destino_str,
+            'Ticket medio': f'USD {ticket_medio}',
+            'Ticket por PAX': f'USD {ticket_pax}',
+            'Gross': gross_str,      
+            'Estado final': estado_cliente_str,
+            'Clasificación Cliente': health_str,
+
+        })
+
+    total_gross = sum(gross_numerico)
+    for i in range(len(resumen)):
+        porcentaje = round(100 * gross_numerico[i] / total_gross, 1)
+        resumen[i]['Gross %'] = f'{porcentaje}%'
+
+    df_resumen = pd.DataFrame(resumen)
+    df_resumen.index = [f'Cluster {i}' for i in sorted(df_subset_pais['cluster_nuevo'].unique())]
+    return df_resumen.transpose()
+
+# ---------------------- EXPORTACIÓN EXCEL ----------------------
+
+resumenes = {'TOTAL': generar_resumen_por_pais(df, df_subset)}
+
+# Agregar filas adicionales al Excel
+for clave in resumenes:
+    df_pais = df if clave == 'TOTAL' else df[df['PAIS_EMISION'] == clave]
+    df_subset_pais = df_subset.loc[df_pais.index.intersection(df_subset.index)].copy()
+
+    clusters_ordenados = sorted(df_subset_pais['cluster_nuevo'].unique())
+    promedio_pax_por_cluster = []
+    top_meses_cluster = []
+
+    for cluster in clusters_ordenados:
+        indices_cluster = df_subset_pais[df_subset_pais['cluster_nuevo'] == cluster].index
+
+        # PAX promedio
+        pax_vals = df_pais.loc[indices_cluster, 'Cantidad PAX por vouchers'].astype(str).str.replace(',', '.', regex=False).astype(float)
+        promedio_pax = round(pax_vals.mean(), 2)
+        promedio_pax_por_cluster.append(promedio_pax)
+        # Top 3 meses con porcentaje
+        meses = df_pais.loc[indices_cluster, 'FECHA_INICIO_VIGENCIA'].dt.month
+        conteo = meses.value_counts(normalize=True).round(3).head(4) * 100
+        nombres_meses_pct = ', '.join([
+            f"{pd.to_datetime(f'2025-{mes}-01').strftime('%b')} ({int(pct)}%)"
+            for mes, pct in conteo.items()
+        ])
+        top_meses_cluster.append(nombres_meses_pct)
+
+
+    fila_pax = pd.DataFrame([["Cantidad PAX por vouchers"] + promedio_pax_por_cluster],
+                            columns=['Indicador'] + [f'Cluster {i}' for i in clusters_ordenados],
+                            index=['PAX Promedio'])
+
+    fila_meses = pd.DataFrame([["Top 3 meses de inicio"] + top_meses_cluster],
+                              columns=['Indicador'] + [f'Cluster {i}' for i in clusters_ordenados],
+                              index=['Meses Inicio'])
+
+    resumenes[clave] = pd.concat([resumenes[clave], fila_pax.set_index('Indicador')])
+    resumenes[clave] = pd.concat([resumenes[clave], fila_meses.set_index('Indicador')])
+
+# Guardar en Excel
+output_path = 'resumen_clusters_multinacional.xlsx'
+with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
+    for sheet, resumen in resumenes.items():
+        resumen.to_excel(writer, sheet_name=sheet.title(), startrow=1, header=False)
+        workbook = writer.book
+        worksheet = writer.sheets[sheet.title()]
+        formato_titulo = workbook.add_format({'bold': True, 'align': 'center', 'border': 1, 'bg_color': '#DDEBF7'})
+        formato_celda = workbook.add_format({'border': 1, 'align': 'center', 'valign': 'vcenter'})
+
+        for col_num, value in enumerate(resumen.columns.insert(0, 'Indicador')):
+            worksheet.write(0, col_num, value, formato_titulo)
+        for row_num, value in enumerate(resumen.index):
+            worksheet.write(row_num + 1, 0, value, formato_celda)
+        for i in range(len(resumen.columns) + 1):
+            worksheet.set_column(i, i, 25)
+        worksheet.freeze_panes(1, 1)
+
+# Descargar archivo
+files.download(output_path)
