@@ -1,6 +1,5 @@
 import pandas as pd
 
-# --- Cargar datos ---
 ruta_df = '/content/drive/MyDrive/2. Segmento_Datos completos todo re todo.csv'
 df = pd.read_csv(ruta_df, sep=';', encoding='utf-8')
 df.columns = df.columns.str.strip()
